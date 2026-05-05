@@ -2,8 +2,7 @@ import config
 import c_eclat 
 
 def solve(min_support, min_confidence, verbose=False):
-    with open('data/config.py', 'r') as f:
-        datapath = [line.split('=')[1].strip().strip("'\"") for line in f if 'datapath' in line][0]
+    datapath = config.datapath
     
     if verbose: print(f"Datapath: {datapath}")
     return c_eclat.solve_cpp(datapath, min_support, min_confidence, verbose)
