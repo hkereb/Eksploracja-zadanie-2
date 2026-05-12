@@ -1,15 +1,21 @@
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC optimize("O3,unroll-loops")
+#pragma GCC target("avx2,bmi,bmi2,lzcnt,popcnt")
+#endif
+
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <iostream>
-#include <fstream>
-#include <sstream>
 #include <vector>
 #include <string>
-#include <map>
+#include <string_view>
 #include <unordered_map>
-#include <set>
 #include <algorithm>
 #include <chrono>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 namespace py = pybind11;
 
@@ -22,8 +28,18 @@ struct Rule {
     double conf;
 };
 
-BitMap intersect_bitmaps(const BitMap& b1, const BitMap& b2) {
-    size_t size = std::min(b1.size(), b2.size());
+struct VectorHash {
+    size_t operator()(const std::vector<int>& v) const {
+        size_t seed = v.size();
+        for (int i : v) {
+            seed ^= i + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        }
+        return seed;
+    }
+};
+
+inline BitMap intersect_bitmaps(const BitMap& b1, const BitMap& b2) {
+    size_t size = b1.size();
     BitMap result(size);
     for (size_t i = 0; i < size; ++i) {
         result[i] = b1[i] & b2[i];
@@ -31,13 +47,13 @@ BitMap intersect_bitmaps(const BitMap& b1, const BitMap& b2) {
     return result;
 }
 
-int count_bits(const BitMap& b) {
+inline int count_bits(const BitMap& b) {
     int count = 0;
     for (uint64_t block : b) {
 #if defined(__GNUC__) || defined(__clang__)
         count += __builtin_popcountll(block); 
 #elif defined(_MSC_VER)
-        count += __popcnt64(block);
+        count += (int)__popcnt64(block); 
 #else
         while (block) {
             block &= (block - 1);
@@ -48,25 +64,45 @@ int count_bits(const BitMap& b) {
     return count;
 }
 
-// eclat
+inline int intersect_and_count(const BitMap& b1, const BitMap& b2, BitMap& result) {
+    size_t size = b1.size();
+    int count = 0;
+    for (size_t i = 0; i < size; ++i) {
+        uint64_t val = b1[i] & b2[i];
+        result[i] = val;
+#if defined(__GNUC__) || defined(__clang__)
+        count += __builtin_popcountll(val); 
+#elif defined(_MSC_VER)
+        count += (int)__popcnt64(val);
+#else
+        uint64_t v = val;
+        while (v) { v &= (v - 1); count++; }
+#endif
+    }
+    return count;
+}
+
 void eclat_dfs(
     const std::vector<int>& prefix,
     const std::vector<std::pair<int, BitMap>>& items,
     int min_supp_count,
-    std::map<std::vector<int>, int>& all_frequent) 
+    std::unordered_map<std::vector<int>, int, VectorHash>& all_frequent) 
 {
     for (size_t i = 0; i < items.size(); ++i) {
         std::vector<int> new_prefix = prefix;
         new_prefix.push_back(items[i].first);
-        std::sort(new_prefix.begin(), new_prefix.end());
         
         all_frequent[new_prefix] = count_bits(items[i].second);
 
         std::vector<std::pair<int, BitMap>> next_items;
+        next_items.reserve(items.size() - i - 1);
+
         for (size_t j = i + 1; j < items.size(); ++j) {
-            BitMap intersection = intersect_bitmaps(items[i].second, items[j].second);
-            if (count_bits(intersection) >= min_supp_count) {
-                next_items.push_back({items[j].first, intersection});
+            BitMap intersection(items[i].second.size()); 
+            int count = intersect_and_count(items[i].second, items[j].second, intersection);
+            
+            if (count >= min_supp_count) {
+                next_items.emplace_back(items[j].first, std::move(intersection));
             }
         }
 
@@ -76,78 +112,104 @@ void eclat_dfs(
     }
 }
 
-// main func
 py::list solve_cpp(std::string path, double min_support, double min_confidence, bool verbose) {
-    // string <-> int
-    std::unordered_map<std::string, int> string_to_id;
+    auto start_time_total = std::chrono::high_resolution_clock::now();
+
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return py::list();
+    
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<char> buffer(file_size + 1);
+    fread(buffer.data(), 1, file_size, f);
+    fclose(f);
+    buffer[file_size] = '\0';
+
+    std::unordered_map<std::string_view, int> string_to_id;
     std::vector<std::string> id_to_string;
+    std::unordered_map<std::string_view, std::vector<int>> trans_dict;
+    
+    char* ptr = buffer.data();
+    
+    while (*ptr && *ptr != '\n') ptr++;
+    if (*ptr == '\n') ptr++;
 
-    // data
-    std::map<std::string, std::vector<int>> trans_dict;
-    std::ifstream file(path);
-    std::string line, invoice, stock_code;
+    while (*ptr) {
+        char* invoice_start = ptr;
+        while (*ptr && *ptr != ',') ptr++;
+        if (!*ptr) break;
+        std::string_view invoice(invoice_start, ptr - invoice_start);
+        ptr++;
 
-    if (file.is_open()) {
-        std::getline(file, line);
-        while (std::getline(file, line)) {
-            std::stringstream ss(line);
-            if (std::getline(ss, invoice, ',') && std::getline(ss, stock_code, ',')) {
-                if (!invoice.empty() && isdigit(invoice[0]) && !stock_code.empty()) {
-                    // add id
-                    if (string_to_id.find(stock_code) == string_to_id.end()) {
-                        string_to_id[stock_code] = id_to_string.size();
-                        id_to_string.push_back(stock_code);
-                    }
-                    trans_dict[invoice].push_back(string_to_id[stock_code]);
-                }
+        char* code_start = ptr;
+        while (*ptr && *ptr != ',') ptr++;
+        std::string_view code(code_start, ptr - code_start);
+
+        while (*ptr && *ptr != '\n') ptr++;
+        if (*ptr == '\n') ptr++;
+
+        if (!invoice.empty() && isdigit(invoice[0]) && !code.empty()) {
+            auto it = string_to_id.find(code);
+            int code_id;
+            if (it == string_to_id.end()) {
+                code_id = (int)id_to_string.size();
+                string_to_id[code] = code_id;
+                id_to_string.emplace_back(code);
+            } else {
+                code_id = it->second;
             }
+            trans_dict[invoice].push_back(code_id);
         }
     }
 
     std::vector<std::vector<int>> transactions;
-    for (auto const& [_, items] : trans_dict) {
-        transactions.push_back(items);
+    transactions.reserve(trans_dict.size());
+    for (auto& pair : trans_dict) {
+        auto& items = pair.second;
+        std::sort(items.begin(), items.end());
+        items.erase(std::unique(items.begin(), items.end()), items.end());
+        transactions.push_back(std::move(items));
     }
 
-    int n_trans = transactions.size();
+    int n_trans = (int)transactions.size();
     if (n_trans == 0) return py::list();
     
     int min_supp_count = std::max(1, (int)(min_support * n_trans));
-    int num_unique_items = id_to_string.size();
+    int num_unique_items = (int)id_to_string.size();
 
-    // transposition
-    std::vector<BitMap> vertical_data(num_unique_items);
+    int num_blocks = (n_trans + 63) / 64;
+    std::vector<BitMap> vertical_data(num_unique_items, BitMap(num_blocks, 0));
+    
     for (int tid = 0; tid < n_trans; ++tid) {
-        for (int item_id : std::set<int>(transactions[tid].begin(), transactions[tid].end())) {
+        for (int item_id : transactions[tid]) {
             int block_idx = tid / 64;
-            if (block_idx >= vertical_data[item_id].size()) {
-                vertical_data[item_id].resize(block_idx + 1, 0);
-            }
             vertical_data[item_id][block_idx] |= (1ULL << (tid % 64));
         }
     }
 
-    // filtering
     std::vector<std::pair<int, BitMap>> frequent_items;
     for (int i = 0; i < num_unique_items; ++i) {
         if (count_bits(vertical_data[i]) >= min_supp_count) {
-            frequent_items.push_back({i, vertical_data[i]});
+            frequent_items.emplace_back(i, std::move(vertical_data[i]));
         }
     }
 
     std::sort(frequent_items.begin(), frequent_items.end(), 
               [](const auto& a, const auto& b) { return count_bits(a.second) < count_bits(b.second); });
 
-    // time start
-    auto start_time = std::chrono::high_resolution_clock::now();
+    auto start_time_algo = std::chrono::high_resolution_clock::now();
 
-    // eclat on ints
-    std::map<std::vector<int>, int> all_frequent;
+    std::unordered_map<std::vector<int>, int, VectorHash> all_frequent;
+    all_frequent.reserve(100000);
     eclat_dfs({}, frequent_items, min_supp_count, all_frequent);
 
-    // generating rules
     std::vector<Rule> rules;
-    for (const auto& [itemset, count] : all_frequent) {
+    rules.reserve(100000);
+    for (const auto& pair : all_frequent) {
+        const auto& itemset = pair.first;
+        int count = pair.second;
+        
         if (itemset.size() < 2) continue;
         
         int num_subsets = (1 << itemset.size()) - 1; 
@@ -158,51 +220,86 @@ py::list solve_cpp(std::string path, double min_support, double min_confidence, 
                 else B.push_back(itemset[i]);
             }
             
-            if (all_frequent.count(A)) {
-                double conf = (double)count / all_frequent[A];
+            auto it_A = all_frequent.find(A);
+            if (it_A != all_frequent.end()) {
+                double conf = (double)count / it_A->second;
                 if (conf >= min_confidence) {
-                    rules.push_back({A, B, (double)count / n_trans, conf});
+                    rules.push_back({std::move(A), std::move(B), (double)count / n_trans, conf});
                 }
             }
         }
     }
 
-    // time end
     auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end_time - start_time;
+    std::chrono::duration<double> duration_total = end_time - start_time_total;
+    std::chrono::duration<double> duration_algo = end_time - start_time_algo;
 
-    std::cout << duration.count() << std::endl;
+    if (!verbose) { 
+        std::cout << "Wygenerowano " << rules.size() << " regul.\n";
+        
+        std::string buffer;
+        buffer.reserve(1024 * 1024); 
+        char num_buf[128]; 
 
-    // int string
-    std::ofstream outfile("rules_output.txt");
-    if (outfile.is_open()) {
         for (const auto& r : rules) {
-            outfile << "{";
-            for (size_t i = 0; i < r.A.size(); ++i) outfile << id_to_string[r.A[i]] << (i < r.A.size() - 1 ? ", " : "");
-            outfile << "} => {";
-            for (size_t i = 0; i < r.B.size(); ++i) outfile << id_to_string[r.B[i]] << (i < r.B.size() - 1 ? ", " : "");
-            outfile << "} | supp: " << r.supp << " conf: " << r.conf << "\n";
+            buffer += "{";
+            for (size_t i = 0; i < r.A.size(); ++i) {
+                buffer += id_to_string[r.A[i]];
+                if (i < r.A.size() - 1) buffer += ", ";
+            }
+            buffer += "} => {";
+            for (size_t i = 0; i < r.B.size(); ++i) {
+                buffer += id_to_string[r.B[i]];
+                if (i < r.B.size() - 1) buffer += ", ";
+            }
+            
+            snprintf(num_buf, sizeof(num_buf), "} Support: %.4f, Confidence: %.4f\n", r.supp, r.conf);
+            buffer += num_buf;
+
+            if (buffer.size() > 1000000) {
+                fwrite(buffer.data(), 1, buffer.size(), stdout);
+                buffer.clear();
+            }
         }
-    } else if (verbose) {
-        std::cerr << "Error: Nie udalo sie zapisac do rules_output.txt\n";
+        
+        if (!buffer.empty()) {
+            fwrite(buffer.data(), 1, buffer.size(), stdout);
+        }
+        fflush(stdout); 
+    }
+    
+    if (!verbose) {
+        std::cerr << "Total Time: " << duration_total.count() << "s | Core Algo Time: " << duration_algo.count() << "s | Rules: " << rules.size() << "\n";
     }
 
-    if (verbose) {
-        std::cerr << "[C++] Time: " << duration.count() << "s | Rules: " << rules.size() << "\n";
+    std::vector<py::str> py_id_to_string;
+    py_id_to_string.reserve(id_to_string.size());
+    for (const auto& s : id_to_string) {
+        py_id_to_string.push_back(py::str(s)); 
     }
 
-    // int back to string (python)
+    py::str key_A("A"), key_B("B"), key_supp("supp"), key_conf("conf");
+
     py::list py_rules;
+    
     for (const auto& r : rules) {
         py::dict d;
-        py::list py_A, py_B;
-        for (int id : r.A) py_A.append(id_to_string[id]);
-        for (int id : r.B) py_B.append(id_to_string[id]);
         
-        d["A"] = py_A;
-        d["B"] = py_B;
-        d["supp"] = r.supp;
-        d["conf"] = r.conf;
+        py::list py_A(r.A.size());
+        for (size_t i = 0; i < r.A.size(); ++i) {
+            py_A[i] = py_id_to_string[r.A[i]]; 
+        }
+        
+        py::list py_B(r.B.size());
+        for (size_t i = 0; i < r.B.size(); ++i) {
+            py_B[i] = py_id_to_string[r.B[i]];
+        }
+        
+        d[key_A] = py_A;
+        d[key_B] = py_B;
+        d[key_supp] = r.supp;
+        d[key_conf] = r.conf;
+        
         py_rules.append(d);
     }
     return py_rules;

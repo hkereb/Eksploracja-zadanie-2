@@ -1,3 +1,6 @@
 secret_solution.py
 data/test.csv
 venv/
+__pycache__/
+build/
+*.pyd
