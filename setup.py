@@ -7,9 +7,9 @@ class get_pybind_include(object):
         return pybind11.get_include()
 
 
-compile_args = ['-std=c++17', '-O3', '-march=native', '-Wall']
+compile_args = ['-std=c++17', '-O3', '-Wall']
 if sys.platform == 'win32':
-    compile_args = ['/O2', '/std:c++17', '/arch:AVX2']
+    compile_args = ['/O2', '/std:c++17'] 
 
 ext_modules = [
     Extension(
