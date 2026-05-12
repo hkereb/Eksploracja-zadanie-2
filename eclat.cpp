@@ -5,6 +5,7 @@
 #include <sstream>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <map>
 #include <unordered_map>
 #include <set>
@@ -79,34 +80,63 @@ void eclat_dfs(
 // main func
 py::list solve_cpp(std::string path, double min_support, double min_confidence, bool verbose) {
     // string <-> int
-    std::unordered_map<std::string, int> string_to_id;
+    std::unordered_map<std::string_view, int> string_to_id;
     std::vector<std::string> id_to_string;
+    std::unordered_map<std::string_view, std::vector<int>> trans_dict;
 
-    // data
-    std::map<std::string, std::vector<int>> trans_dict;
-    std::ifstream file(path);
-    std::string line, invoice, stock_code;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return py::list();
+    
+    fseek(f, 0, SEEK_END);
+    size_t file_size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<char> buffer(file_size + 1);
+    fread(buffer.data(), 1, file_size, f);
+    fclose(f);
+    buffer[file_size] = '\0';
 
-    if (file.is_open()) {
-        std::getline(file, line);
-        while (std::getline(file, line)) {
-            std::stringstream ss(line);
-            if (std::getline(ss, invoice, ',') && std::getline(ss, stock_code, ',')) {
-                if (!invoice.empty() && isdigit(invoice[0]) && !stock_code.empty()) {
-                    // add id
-                    if (string_to_id.find(stock_code) == string_to_id.end()) {
-                        string_to_id[stock_code] = id_to_string.size();
-                        id_to_string.push_back(stock_code);
-                    }
-                    trans_dict[invoice].push_back(string_to_id[stock_code]);
-                }
+    char* ptr = buffer.data();
+    
+    // skip header
+    while (*ptr && *ptr != '\n') ptr++;
+    if (*ptr == '\n') ptr++;
+
+    // parsing
+    while (*ptr) {
+        char* invoice_start = ptr;
+        while (*ptr && *ptr != ',') ptr++;
+        if (!*ptr) break;
+        std::string_view invoice(invoice_start, ptr - invoice_start);
+        ptr++;
+
+        char* code_start = ptr;
+        while (*ptr && *ptr != ',') ptr++;
+        std::string_view code(code_start, ptr - code_start);
+
+        while (*ptr && *ptr != '\n') ptr++;
+        if (*ptr == '\n') ptr++;
+
+        if (!invoice.empty() && isdigit(invoice[0]) && !code.empty()) {
+            auto it = string_to_id.find(code);
+            int code_id;
+            if (it == string_to_id.end()) {
+                code_id = (int)id_to_string.size();
+                string_to_id[code] = code_id;
+                id_to_string.emplace_back(code);
+            } else {
+                code_id = it->second;
             }
+            trans_dict[invoice].push_back(code_id);
         }
     }
 
     std::vector<std::vector<int>> transactions;
-    for (auto const& [_, items] : trans_dict) {
-        transactions.push_back(items);
+    transactions.reserve(trans_dict.size());
+    for (auto& pair : trans_dict) {
+        auto& items = pair.second;
+        std::sort(items.begin(), items.end());
+        items.erase(std::unique(items.begin(), items.end()), items.end());
+        transactions.push_back(std::move(items));
     }
 
     int n_trans = transactions.size();
@@ -118,7 +148,7 @@ py::list solve_cpp(std::string path, double min_support, double min_confidence, 
     // transposition
     std::vector<BitMap> vertical_data(num_unique_items);
     for (int tid = 0; tid < n_trans; ++tid) {
-        for (int item_id : std::set<int>(transactions[tid].begin(), transactions[tid].end())) {
+        for (int item_id : transactions[tid]) {
             int block_idx = tid / 64;
             if (block_idx >= vertical_data[item_id].size()) {
                 vertical_data[item_id].resize(block_idx + 1, 0);
